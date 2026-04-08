@@ -1,6 +1,7 @@
+
 [build]
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python backtest_gold_scalper.py --mode both --balance 5000 --risk 0.5"
+startCommand = "python optimize_gold_scalper.py"
 restartPolicyType = "never"
