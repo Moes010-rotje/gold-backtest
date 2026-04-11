@@ -1,15 +1,16 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     XAUUSD GOLD SCALPER — BACKTEST v1.5 + TRAILING STOP     ║
-║  Test: v1.5 zonder trail vs v1.5 MET trail                  ║
-║  Zie exact hoeveel de trailing runner toevoegt               ║
+║     XAUUSD GOLD SCALPER — DAILY PROFIT ANALYZER             ║
+║  Target: $100-200 per dag consistent                         ║
+║  Test: Risk levels, extra indicators, strategiewijzigingen   ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
 import sys, json, time
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 from enum import Enum
+from collections import defaultdict
 
 try:
     import pandas as pd
@@ -29,12 +30,12 @@ class Direction(Enum):
 class TradePhase(Enum):
     OPEN = "open"
     TP1_HIT = "tp1_hit"
-    TRAILING = "trailing"
     CLOSED = "closed"
 
 
 @dataclass
 class Config:
+    LABEL: str = "v1.5 Base"
     START_BALANCE: float = 5000.0
     COMMISSION_PER_LOT: float = 7.0
     SIMULATED_SPREAD: float = 0.30
@@ -63,43 +64,53 @@ class Config:
     TRADE_COOLDOWN_BARS: int = 5
     LOSS_COOLDOWN_BARS: int = 12
 
-    # Trailing stop
-    USE_TRAILING: bool = False
-    TRAIL_ACTIVATION_RR: float = 1.0
-    TRAIL_ATR_MULT: float = 0.8
-    TRAIL_STEP: float = 0.5
-    REMOVE_TP: bool = True
-
     SWEEP_WICK_ATR_MIN: float = 0.25
     FVG_MIN_ATR: float = 0.25
     DOUBLE_TOLERANCE_ATR: float = 0.3
     ADX_THRESHOLD: float = 25.0
+
+    # Extra toggles
+    USE_MACD: bool = False
+    USE_STOCH: bool = False
+    USE_EMA50_FILTER: bool = False
+    USE_HIGHER_TF_TREND: bool = False
 
 
 def calculate_indicators(df):
     df = df.copy()
     df["ema9"] = df["Close"].ewm(span=9).mean()
     df["ema21"] = df["Close"].ewm(span=21).mean()
+    df["ema50"] = df["Close"].ewm(span=50).mean()
     df["tr"] = np.maximum(df["High"]-df["Low"], np.maximum(abs(df["High"]-df["Close"].shift(1)), abs(df["Low"]-df["Close"].shift(1))))
     df["atr"] = df["tr"].rolling(14).mean()
+
+    # RSI 7
     d = df["Close"].diff()
     g = d.clip(lower=0).rolling(7).mean()
     l = (-d.clip(upper=0)).rolling(7).mean()
     rs = g / l.replace(0, np.nan)
     df["rsi"] = 100 - (100/(1+rs))
+
+    # RSI 14
     d14 = df["Close"].diff()
     g14 = d14.clip(lower=0).rolling(14).mean()
     l14 = (-d14.clip(upper=0)).rolling(14).mean()
     rs14 = g14 / l14.replace(0, np.nan)
     df["rsi14"] = 100 - (100/(1+rs14))
+
+    # BB
     df["bb_mid"] = df["Close"].rolling(20).mean()
     df["bb_std"] = df["Close"].rolling(20).std()
     df["bb_upper"] = df["bb_mid"] + 2*df["bb_std"]
     df["bb_lower"] = df["bb_mid"] - 2*df["bb_std"]
+
+    # Candle
     df["body"] = abs(df["Close"]-df["Open"])
     df["candle_range"] = df["High"]-df["Low"]
     df["upper_wick"] = df["High"] - df[["Close","Open"]].max(axis=1)
     df["lower_wick"] = df[["Close","Open"]].min(axis=1) - df["Low"]
+
+    # ADX
     plus_dm = df["High"].diff()
     minus_dm = -df["Low"].diff()
     plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
@@ -109,6 +120,23 @@ def calculate_indicators(df):
     minus_di = 100 * (minus_dm.rolling(14).mean() / atr14.replace(0, np.nan))
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
     df["adx"] = dx.rolling(14).mean()
+
+    # MACD
+    ema12 = df["Close"].ewm(span=12).mean()
+    ema26 = df["Close"].ewm(span=26).mean()
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(span=9).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    # Stochastic
+    low14 = df["Low"].rolling(14).min()
+    high14 = df["High"].rolling(14).max()
+    df["stoch_k"] = ((df["Close"] - low14) / (high14 - low14).replace(0, np.nan)) * 100
+    df["stoch_d"] = df["stoch_k"].rolling(3).mean()
+
+    # Higher TF trend (EMA50 slope)
+    df["ema50_slope"] = df["ema50"] - df["ema50"].shift(10)
+
     return df
 
 
@@ -137,11 +165,11 @@ def detect_signal(df, i, cfg, swing_highs, swing_lows):
     ch, cl, cc, co = df["High"].iloc[i], df["Low"].iloc[i], df["Close"].iloc[i], df["Open"].iloc[i]
     body, total = df["body"].iloc[i], df["candle_range"].iloc[i]
 
-    # EMA
+    # 1. EMA
     if ema9 > ema21: votes[Direction.LONG] += 1; reasons.append("ema")
     else: votes[Direction.SHORT] += 1; reasons.append("ema")
 
-    # Sweep
+    # 2. Sweep
     for si in [s for s in swing_lows if s < i and s > i-25][-3:]:
         if cl < df["Low"].iloc[si] and cc > df["Low"].iloc[si]:
             wick = min(cc, co) - cl
@@ -151,7 +179,7 @@ def detect_signal(df, i, cfg, swing_highs, swing_lows):
             wick = ch - max(cc, co)
             if wick > atr*cfg.SWEEP_WICK_ATR_MIN: votes[Direction.SHORT] += 2; reasons.append("sweep"); break
 
-    # OB
+    # 3. OB
     if i >= 2:
         prev, curr = df.iloc[i-1], df.iloc[i]
         pb, cb = abs(prev["Close"]-prev["Open"]), abs(curr["Close"]-curr["Open"])
@@ -160,7 +188,7 @@ def detect_signal(df, i, cfg, swing_highs, swing_lows):
         elif curr["Close"]<curr["Open"] and prev["Close"]>prev["Open"] and cb>pb*cfg.ENGULF_BODY_RATIO and curr["Close"]<prev["Low"]:
             votes[Direction.SHORT] += 1; reasons.append("ob")
 
-    # FVG
+    # 4. FVG
     if i >= 2:
         c1h, c3l = df["High"].iloc[i-2], df["Low"].iloc[i]
         c1l, c3h = df["Low"].iloc[i-2], df["High"].iloc[i]
@@ -168,12 +196,12 @@ def detect_signal(df, i, cfg, swing_highs, swing_lows):
         if c3l > c1h and (c3l-c1h) >= mg: votes[Direction.LONG] += 1; reasons.append("fvg")
         elif c1l > c3h and (c1l-c3h) >= mg: votes[Direction.SHORT] += 1; reasons.append("fvg")
 
-    # Momentum
+    # 5. Momentum
     if total > 0 and body/total >= cfg.ENGULF_BODY_RATIO and body >= atr*cfg.MOMENTUM_CANDLE_ATR:
         if cc > co: votes[Direction.LONG] += 1; reasons.append("mom")
         else: votes[Direction.SHORT] += 1; reasons.append("mom")
 
-    # Mean Reversion
+    # 6. Mean Reversion
     bb_u, bb_l = df["bb_upper"].iloc[i], df["bb_lower"].iloc[i]
     if not (pd.isna(bb_u) or pd.isna(rsi)):
         bbr = bb_u - bb_l
@@ -182,13 +210,13 @@ def detect_signal(df, i, cfg, swing_highs, swing_lows):
             if pct_b <= 0.05 and rsi <= cfg.RSI_OVERSOLD: votes[Direction.LONG] += cfg.MR_CONFLUENCE_SCORE; reasons.append("MR")
             elif pct_b >= 0.95 and rsi >= cfg.RSI_OVERBOUGHT: votes[Direction.SHORT] += cfg.MR_CONFLUENCE_SCORE; reasons.append("MR")
 
-    # RSI div
+    # 7. RSI div
     rsi14 = df["rsi14"].iloc[i]
     if not pd.isna(rsi14):
         if rsi14 < 30 and cc > df["Close"].iloc[i-5]: votes[Direction.LONG] += 1; reasons.append("rsi_div")
         elif rsi14 > 70 and cc < df["Close"].iloc[i-5]: votes[Direction.SHORT] += 1; reasons.append("rsi_div")
 
-    # Double
+    # 8. Double
     recent_sl = [s for s in swing_lows if s < i and s > i-30]
     recent_sh = [s for s in swing_highs if s < i and s > i-30]
     tol = atr * cfg.DOUBLE_TOLERANCE_ATR
@@ -199,11 +227,42 @@ def detect_signal(df, i, cfg, swing_highs, swing_lows):
         h1, h2 = df["High"].iloc[recent_sh[-2]], df["High"].iloc[recent_sh[-1]]
         if abs(h1-h2) < tol and price < min(h1,h2): votes[Direction.SHORT] += 1; reasons.append("dbl")
 
-    # ADX
+    # 9. ADX
     adx = df["adx"].iloc[i]
     if not pd.isna(adx) and adx >= cfg.ADX_THRESHOLD:
         confluence += 1; reasons.append("adx")
 
+    # 10. MACD (extra)
+    if cfg.USE_MACD:
+        macd_h = df["macd_hist"].iloc[i]
+        macd_h_prev = df["macd_hist"].iloc[i-1]
+        if not pd.isna(macd_h) and not pd.isna(macd_h_prev):
+            if macd_h > 0 and macd_h > macd_h_prev: votes[Direction.LONG] += 1; reasons.append("macd")
+            elif macd_h < 0 and macd_h < macd_h_prev: votes[Direction.SHORT] += 1; reasons.append("macd")
+
+    # 11. Stochastic (extra)
+    if cfg.USE_STOCH:
+        stk = df["stoch_k"].iloc[i]
+        std = df["stoch_d"].iloc[i]
+        if not pd.isna(stk) and not pd.isna(std):
+            if stk < 20 and stk > std: votes[Direction.LONG] += 1; reasons.append("stoch")
+            elif stk > 80 and stk < std: votes[Direction.SHORT] += 1; reasons.append("stoch")
+
+    # 12. EMA50 filter (extra)
+    if cfg.USE_EMA50_FILTER:
+        ema50 = df["ema50"].iloc[i]
+        if not pd.isna(ema50):
+            if price > ema50 and ema9 > ema50: votes[Direction.LONG] += 1; reasons.append("ema50")
+            elif price < ema50 and ema9 < ema50: votes[Direction.SHORT] += 1; reasons.append("ema50")
+
+    # 13. Higher TF trend (extra)
+    if cfg.USE_HIGHER_TF_TREND:
+        slope = df["ema50_slope"].iloc[i]
+        if not pd.isna(slope):
+            if slope > 0: votes[Direction.LONG] += 1; reasons.append("htf")
+            elif slope < 0: votes[Direction.SHORT] += 1; reasons.append("htf")
+
+    # Direction
     ls, ss = votes[Direction.LONG], votes[Direction.SHORT]
     if ls > ss and ls >= 1: direction = Direction.LONG; confluence += ls
     elif ss > ls and ss >= 1: direction = Direction.SHORT; confluence += ss
@@ -218,135 +277,53 @@ def detect_signal(df, i, cfg, swing_highs, swing_lows):
 @dataclass
 class Trade:
     direction: Direction; entry: float; sl: float; tp: float; tp1: float
-    lots: float; bar: int; sl_dist: float; entry_time: str = ""
+    lots: float; bar: int; sl_dist: float; day: str = ""
     phase: TradePhase = TradePhase.OPEN
     pnl: float = 0.0; remaining: float = 0.0
-    exit_reason: str = ""; max_profit_r: float = 0.0
-    trail_activated: bool = False
     def __post_init__(self): self.remaining = self.lots
 
 
-def run_backtest(df, cfg, sh, sl, label=""):
+def run_backtest(df, cfg, sh, sl):
     balance = cfg.START_BALANCE; peak = balance; max_dd = 0.0
     active, closed = [], []; daily_trades = 0; daily_date = ""
     consec_losses = 0; ltb = -999; llb = -999
-    monthly_pnl = {}
-    big_winners = []  # trades that made $50+
-
-    total_bars = len(df)
-    report_interval = max(1, total_bars // 10)
+    daily_pnl_tracker: Dict[str, float] = {}
 
     for i in range(60, len(df)):
-        if (i-60) % report_interval == 0:
-            pct = (i-60)/(total_bars-60)*100
-            print(f"  {pct:.0f}% | Balance: ${balance:,.2f} | Trades: {len(closed)}")
-
         price, high, low = df["Close"].iloc[i], df["High"].iloc[i], df["Low"].iloc[i]
         atr = df["atr"].iloc[i]
         if pd.isna(atr) or price <= 0: continue
         ts = df.index[i]
         today = str(ts.date()) if hasattr(ts,'date') else str(ts)[:10]
         if today != daily_date: daily_date = today; daily_trades = 0
+        if today not in daily_pnl_tracker: daily_pnl_tracker[today] = 0.0
 
         for t in list(active):
-            # Check SL
             if (t.direction==Direction.LONG and low<=t.sl) or (t.direction==Direction.SHORT and high>=t.sl):
-                if t.direction == Direction.LONG:
-                    t.pnl += (t.sl-t.entry)*t.remaining*100
-                else:
-                    t.pnl += (t.entry-t.sl)*t.remaining*100
+                t.pnl += ((t.sl-t.entry) if t.direction==Direction.LONG else (t.entry-t.sl))*t.remaining*100
                 t.pnl -= cfg.COMMISSION_PER_LOT*t.remaining; balance += t.pnl
-                t.exit_reason = "TRAIL_SL" if t.trail_activated else "SL"
-                consec_losses += 1 if not t.trail_activated else 0; llb = i
-                active.remove(t); closed.append(t)
-                if t.pnl >= 50: big_winners.append(t)
-                continue
-
-            # Check TP (only if trailing not active or TP not removed)
-            if not (cfg.USE_TRAILING and t.trail_activated and cfg.REMOVE_TP):
-                if (t.direction==Direction.LONG and high>=t.tp) or (t.direction==Direction.SHORT and low<=t.tp):
-                    if t.direction == Direction.LONG:
-                        t.pnl += (t.tp-t.entry)*t.remaining*100
-                    else:
-                        t.pnl += (t.entry-t.tp)*t.remaining*100
-                    t.pnl -= cfg.COMMISSION_PER_LOT*t.remaining; balance += t.pnl
-                    t.exit_reason = "TP"; consec_losses = 0
-                    active.remove(t); closed.append(t)
-                    if t.pnl >= 50: big_winners.append(t)
-                    continue
-
-            # Track max profit in R
-            if t.direction == Direction.LONG:
-                curr_r = (high - t.entry) / t.sl_dist if t.sl_dist > 0 else 0
-            else:
-                curr_r = (t.entry - low) / t.sl_dist if t.sl_dist > 0 else 0
-            if curr_r > t.max_profit_r: t.max_profit_r = curr_r
-
-            # Partial close at TP1
+                daily_pnl_tracker[today] += t.pnl
+                consec_losses += 1; llb = i; active.remove(t); closed.append(t); continue
+            if (t.direction==Direction.LONG and high>=t.tp) or (t.direction==Direction.SHORT and low<=t.tp):
+                t.pnl += ((t.tp-t.entry) if t.direction==Direction.LONG else (t.entry-t.tp))*t.remaining*100
+                t.pnl -= cfg.COMMISSION_PER_LOT*t.remaining; balance += t.pnl
+                daily_pnl_tracker[today] += t.pnl
+                consec_losses = 0; active.remove(t); closed.append(t); continue
             if t.phase == TradePhase.OPEN:
                 if (t.direction==Direction.LONG and high>=t.tp1) or (t.direction==Direction.SHORT and low<=t.tp1):
                     cl = round(t.lots*cfg.PARTIAL_PERCENT, 2)
                     if cl >= 0.01:
-                        if t.direction == Direction.LONG:
-                            p = (t.tp1-t.entry)*cl*100
-                        else:
-                            p = (t.entry-t.tp1)*cl*100
+                        p = ((t.tp1-t.entry) if t.direction==Direction.LONG else (t.entry-t.tp1))*cl*100
                         p -= cfg.COMMISSION_PER_LOT*cl; balance += p; t.pnl += p
-                        t.remaining = round(t.remaining-cl, 2)
-                        t.phase = TradePhase.TP1_HIT
+                        daily_pnl_tracker[today] += p
+                        t.remaining = round(t.remaining-cl, 2); t.phase = TradePhase.TP1_HIT
                         if cfg.MOVE_SL_TO_BE: t.sl = t.entry
 
-            # Trailing stop logic
-            if cfg.USE_TRAILING and t.phase == TradePhase.TP1_HIT:
-                if t.direction == Direction.LONG:
-                    profit_r = (price - t.entry) / t.sl_dist if t.sl_dist > 0 else 0
-                else:
-                    profit_r = (t.entry - price) / t.sl_dist if t.sl_dist > 0 else 0
-
-                if profit_r >= cfg.TRAIL_ACTIVATION_RR:
-                    t.trail_activated = True
-                    t.phase = TradePhase.TRAILING
-                    trail_dist = atr * cfg.TRAIL_ATR_MULT
-
-                    if t.direction == Direction.LONG:
-                        new_sl = price - trail_dist
-                        if new_sl > t.sl + cfg.TRAIL_STEP:
-                            t.sl = new_sl
-                    else:
-                        new_sl = price + trail_dist
-                        if new_sl < t.sl - cfg.TRAIL_STEP:
-                            t.sl = new_sl
-
-                elif t.phase == TradePhase.TRAILING:
-                    trail_dist = atr * cfg.TRAIL_ATR_MULT
-                    if t.direction == Direction.LONG:
-                        new_sl = price - trail_dist
-                        if new_sl > t.sl + cfg.TRAIL_STEP:
-                            t.sl = new_sl
-                    else:
-                        new_sl = price + trail_dist
-                        if new_sl < t.sl - cfg.TRAIL_STEP:
-                            t.sl = new_sl
-
-            # Continue trailing if already activated
-            if cfg.USE_TRAILING and t.phase == TradePhase.TRAILING:
-                trail_dist = atr * cfg.TRAIL_ATR_MULT
-                if t.direction == Direction.LONG:
-                    new_sl = price - trail_dist
-                    if new_sl > t.sl + cfg.TRAIL_STEP:
-                        t.sl = new_sl
-                else:
-                    new_sl = price + trail_dist
-                    if new_sl < t.sl - cfg.TRAIL_STEP:
-                        t.sl = new_sl
-
-        # Equity
         eq = balance + sum(((price-t.entry) if t.direction==Direction.LONG else (t.entry-price))*t.remaining*100 for t in active)
         if eq > peak: peak = eq
         dd = (peak-eq)/peak*100 if peak > 0 else 0
         if dd > max_dd: max_dd = dd
 
-        # Gates
         if daily_trades >= cfg.MAX_DAILY_TRADES: continue
         if len(active) >= cfg.MAX_CONCURRENT_TRADES: continue
         if consec_losses >= cfg.MAX_CONSECUTIVE_LOSSES:
@@ -370,7 +347,7 @@ def run_backtest(df, cfg, sh, sl, label=""):
 
         lots = max(0.01, min(round((balance*cfg.RISK_PERCENT/100)/(sl_dist*100), 2), 0.5))
         trade = Trade(direction=direction, entry=entry, sl=s, tp=t, tp1=t1,
-                      lots=lots, bar=i, sl_dist=sl_dist, entry_time=str(ts))
+                      lots=lots, bar=i, sl_dist=sl_dist, day=today)
         active.append(trade)
         daily_trades += 1; ltb = i
 
@@ -379,10 +356,11 @@ def run_backtest(df, cfg, sh, sl, label=""):
         lp = df["Close"].iloc[-1]
         for t in active:
             t.pnl += ((lp-t.entry) if t.direction==Direction.LONG else (t.entry-lp))*t.remaining*100
-            t.exit_reason = "END"; closed.append(t)
+            today = t.day
+            if today in daily_pnl_tracker: daily_pnl_tracker[today] += t.pnl
+            closed.append(t)
 
-    if not closed:
-        print("  No trades!"); return {}
+    if not closed: return None
 
     wins = [t for t in closed if t.pnl > 0]
     losses = [t for t in closed if t.pnl <= 0]
@@ -391,101 +369,45 @@ def run_backtest(df, cfg, sh, sl, label=""):
     pf = tw/tl if tl > 0 else 99
     net = balance - cfg.START_BALANCE
 
-    # Monthly
-    for t in closed:
-        m = t.entry_time[:7] if t.entry_time else "?"
-        if m not in monthly_pnl: monthly_pnl[m] = 0
-        monthly_pnl[m] += t.pnl
-
-    # Exit stats
-    exit_stats = {}
-    for t in closed:
-        r = t.exit_reason
-        if r not in exit_stats: exit_stats[r] = {"count":0,"pnl":0}
-        exit_stats[r]["count"] += 1; exit_stats[r]["pnl"] += t.pnl
-
-    # Runner stats
-    trail_trades = [t for t in closed if t.trail_activated]
-    trail_wins = [t for t in trail_trades if t.pnl > 0]
-    max_runner_pnl = max([t.pnl for t in trail_trades], default=0)
-    avg_runner_pnl = sum(t.pnl for t in trail_trades)/len(trail_trades) if trail_trades else 0
-    max_r_reached = max([t.max_profit_r for t in closed], default=0)
-
-    # Big winners
-    big_50 = [t for t in closed if t.pnl >= 50]
-    big_100 = [t for t in closed if t.pnl >= 100]
-
-    # Streaks
-    max_ws, max_ls, cw, cl = 0, 0, 0, 0
-    for t in closed:
-        if t.pnl > 0: cw += 1; cl = 0; max_ws = max(max_ws, cw)
-        else: cl += 1; cw = 0; max_ls = max(max_ls, cl)
-
-    print(f"\n{'='*60}")
-    print(f"  📊 {label} RESULTS")
-    print(f"{'='*60}")
-    print(f"""
-  💰 Start:     ${cfg.START_BALANCE:>10,.2f}
-  💰 Final:     ${balance:>10,.2f}
-  📈 Net P&L:   ${net:>+10,.2f}
-  📈 Return:    {net/cfg.START_BALANCE*100:>+9.2f}%
-  📉 Max DD:    {max_dd:>9.2f}%
-
-  ─── TRADES ──────────────────────────────────
-  Total:        {len(closed):>8}
-  Wins:         {len(wins):>8}
-  Losses:       {len(losses):>8}
-  Win Rate:     {wr:>7.1f}%
-  PF:           {pf:>8.2f}
-
-  ─── AVERAGES ────────────────────────────────
-  Avg Win:      ${tw/max(len(wins),1):>+9.2f}
-  Avg Loss:     ${tl/max(len(losses),1):>9.2f}
-  Max Win:      ${max(t.pnl for t in closed):>+9.2f}
-  Max Loss:     ${min(t.pnl for t in closed):>9.2f}
-
-  ─── STREAKS ─────────────────────────────────
-  Max Win:      {max_ws:>8}
-  Max Loss:     {max_ls:>8}
-
-  ─── BIG WINNERS 💰 ─────────────────────────
-  $50+ trades:  {len(big_50):>8}
-  $100+ trades: {len(big_100):>8}
-  Max R reached:{max_r_reached:>7.1f}R""")
-
-    if cfg.USE_TRAILING:
-        print(f"""
-  ─── RUNNER / TRAILING STATS 🏃 ──────────────
-  Runners activated:  {len(trail_trades):>5}
-  Runner wins:        {len(trail_wins):>5}
-  Runner WR:          {len(trail_wins)/max(len(trail_trades),1)*100:>5.0f}%
-  Avg runner PnL:     ${avg_runner_pnl:>+8.2f}
-  Best runner:        ${max_runner_pnl:>+8.2f}""")
-
-    print(f"\n  ─── EXIT REASONS ────────────────────────────")
-    for r, d in sorted(exit_stats.items()):
-        print(f"  {r:>10}: {d['count']:>5}t | PnL: ${d['pnl']:>+10,.2f}")
-
-    print(f"\n  ─── MONTHLY P&L ─────────────────────────────")
-    for m in sorted(monthly_pnl.keys()):
-        e = "🟢" if monthly_pnl[m] >= 0 else "🔴"
-        print(f"  {e} {m}: ${monthly_pnl[m]:>+10,.2f}")
+    # Daily stats
+    trading_days = [d for d, p in daily_pnl_tracker.items() if abs(p) > 0.01]
+    daily_pnls = [daily_pnl_tracker[d] for d in trading_days]
+    green_days = [p for p in daily_pnls if p > 0]
+    red_days = [p for p in daily_pnls if p <= 0]
+    days_100 = [p for p in daily_pnls if p >= 100]
+    days_200 = [p for p in daily_pnls if p >= 200]
+    days_50 = [p for p in daily_pnls if p >= 50]
 
     return {
+        "label": cfg.LABEL,
+        "risk": cfg.RISK_PERCENT,
         "trades": len(closed), "wr": round(wr,1), "pf": round(pf,2),
         "pnl": round(net,2), "dd": round(max_dd,2),
-        "return": round(net/cfg.START_BALANCE*100,2),
-        "big_50": len(big_50), "big_100": len(big_100),
-        "runners": len(trail_trades), "best_runner": round(max_runner_pnl,2),
+        "return_pct": round(net/cfg.START_BALANCE*100,2),
+        "balance": round(balance,2),
         "avg_win": round(tw/max(len(wins),1),2),
+        "avg_loss": round(tl/max(len(losses),1),2),
+        "trading_days": len(trading_days),
+        "green_days": len(green_days),
+        "red_days": len(red_days),
+        "green_pct": round(len(green_days)/max(len(trading_days),1)*100,1),
+        "avg_daily": round(sum(daily_pnls)/max(len(trading_days),1),2),
+        "best_day": round(max(daily_pnls, default=0),2),
+        "worst_day": round(min(daily_pnls, default=0),2),
+        "days_50": len(days_50),
+        "days_100": len(days_100),
+        "days_200": len(days_200),
+        "median_day": round(np.median(daily_pnls),2) if daily_pnls else 0,
+        "daily_pnls": {d: round(p,2) for d, p in sorted(daily_pnl_tracker.items()) if abs(p) > 0.01},
     }
 
 
 def main():
     print("""
 ╔══════════════════════════════════════════════════════════════╗
-║     XAUUSD GOLD SCALPER — v1.5 TRAILING STOP BACKTEST       ║
-║     Test: ZONDER trail vs MET trail                          ║
+║     XAUUSD GOLD SCALPER — DAILY PROFIT ANALYZER             ║
+║     🎯 Target: $100-200 per dag consistent                  ║
+║     Test: Risk levels + extra indicators                     ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
     print("📥 Downloading 60-day gold data...")
@@ -500,43 +422,163 @@ def main():
     df = calculate_indicators(df)
     sh, sl = detect_swings(df, 3)
 
-    # Test 1: v1.5 WITHOUT trailing
-    print(f"\n{'='*60}")
-    print(f"  🔵 TEST 1: v1.5 ZONDER TRAILING STOP")
-    print(f"{'='*60}")
-    cfg1 = Config()
-    cfg1.USE_TRAILING = False
-    r1 = run_backtest(df, cfg1, sh, sl, "v1.5 ZONDER TRAIL")
+    # ═══════════════════════════════════════════════════════════
+    #  TEST SUITE
+    # ═══════════════════════════════════════════════════════════
 
-    # Test 2: v1.5 WITH trailing
-    print(f"\n{'='*60}")
-    print(f"  🟢 TEST 2: v1.5 MET TRAILING STOP")
-    print(f"{'='*60}")
-    cfg2 = Config()
-    cfg2.USE_TRAILING = True
-    r2 = run_backtest(df, cfg2, sh, sl, "v1.5 MET TRAIL")
+    tests = []
 
-    # Comparison
-    if r1 and r2:
+    # 1. Risk level comparison
+    for risk in [0.5, 0.75, 1.0, 1.5, 2.0]:
+        cfg = Config()
+        cfg.LABEL = f"Risk {risk}%"
+        cfg.RISK_PERCENT = risk
+        if risk >= 1.5: cfg.MAX_DAILY_LOSS_PERCENT = 5.0
+        if risk >= 2.0: cfg.MAX_TOTAL_DRAWDOWN_PERCENT = 15.0
+        tests.append(cfg)
+
+    # 2. Risk 1% + MACD extra confluence
+    cfg = Config(); cfg.LABEL = "1% + MACD"; cfg.RISK_PERCENT = 1.0; cfg.USE_MACD = True
+    tests.append(cfg)
+
+    # 3. Risk 1% + Stochastic
+    cfg = Config(); cfg.LABEL = "1% + Stoch"; cfg.RISK_PERCENT = 1.0; cfg.USE_STOCH = True
+    tests.append(cfg)
+
+    # 4. Risk 1% + EMA50 filter
+    cfg = Config(); cfg.LABEL = "1% + EMA50"; cfg.RISK_PERCENT = 1.0; cfg.USE_EMA50_FILTER = True
+    tests.append(cfg)
+
+    # 5. Risk 1% + Higher TF trend
+    cfg = Config(); cfg.LABEL = "1% + HTF"; cfg.RISK_PERCENT = 1.0; cfg.USE_HIGHER_TF_TREND = True
+    tests.append(cfg)
+
+    # 6. Risk 1% + ALL extra indicators
+    cfg = Config(); cfg.LABEL = "1% + ALL EXTRA"; cfg.RISK_PERCENT = 1.0
+    cfg.USE_MACD = True; cfg.USE_STOCH = True; cfg.USE_EMA50_FILTER = True; cfg.USE_HIGHER_TF_TREND = True
+    tests.append(cfg)
+
+    # 7. Risk 1% + Confluence 4 (stricter)
+    cfg = Config(); cfg.LABEL = "1% Conf≥4"; cfg.RISK_PERCENT = 1.0; cfg.MIN_CONFLUENCE = 4
+    tests.append(cfg)
+
+    # 8. Risk 1% + Max 4 concurrent
+    cfg = Config(); cfg.LABEL = "1% Max4 Open"; cfg.RISK_PERCENT = 1.0; cfg.MAX_CONCURRENT_TRADES = 4
+    tests.append(cfg)
+
+    # 9. Risk 1% + Shorter cooldowns
+    cfg = Config(); cfg.LABEL = "1% Fast CD"; cfg.RISK_PERCENT = 1.0
+    cfg.TRADE_COOLDOWN_BARS = 3; cfg.LOSS_COOLDOWN_BARS = 5
+    tests.append(cfg)
+
+    # 10. Risk 1% + ALL extras + Conf 4 (quality + volume)
+    cfg = Config(); cfg.LABEL = "1% QUALITY MAX"; cfg.RISK_PERCENT = 1.0
+    cfg.USE_MACD = True; cfg.USE_STOCH = True; cfg.MIN_CONFLUENCE = 4
+    tests.append(cfg)
+
+    # Run all tests
+    results = []
+    print(f"\n  Running {len(tests)} configurations...\n")
+
+    for i, cfg in enumerate(tests):
+        print(f"  [{i+1}/{len(tests)}] {cfg.LABEL}...")
+        r = run_backtest(df, cfg, sh, sl)
+        if r:
+            results.append(r)
+            print(f"       WR:{r['wr']}% | PF:{r['pf']} | Avg/day:${r['avg_daily']:+.0f} | "
+                  f"$100+ days:{r['days_100']} | DD:{r['dd']:.1f}%")
+
+    # ═══════════════════════════════════════════════════════════
+    #  RESULTS
+    # ═══════════════════════════════════════════════════════════
+
+    print(f"\n{'='*80}")
+    print(f"  📊 DAILY PROFIT ANALYSIS — {len(results)} CONFIGURATIONS TESTED")
+    print(f"{'='*80}")
+
+    # Overview table
+    print(f"\n  {'Config':<20} {'Risk':>5} {'WR':>6} {'PF':>5} {'$/Day':>8} {'$100+':>6} {'$200+':>6} {'Green%':>7} {'DD':>6} {'Total':>10}")
+    print(f"  {'-'*85}")
+    for r in sorted(results, key=lambda x: x["avg_daily"], reverse=True):
+        print(f"  {r['label']:<20} {r['risk']:>4.1f}% {r['wr']:>5.1f}% {r['pf']:>4.2f} "
+              f"${r['avg_daily']:>+6.0f} {r['days_100']:>5}d {r['days_200']:>5}d "
+              f"{r['green_pct']:>5.0f}%  {r['dd']:>5.1f}% ${r['pnl']:>+9,.0f}")
+
+    # Detailed daily breakdown for top 3
+    top3 = sorted(results, key=lambda x: x["avg_daily"], reverse=True)[:3]
+
+    for r in top3:
+        print(f"\n  {'='*60}")
+        print(f"  📅 DAILY BREAKDOWN: {r['label']}")
+        print(f"  {'='*60}")
         print(f"""
-{'='*60}
-  ⚖️ VERGELIJKING: TRAIL vs GEEN TRAIL
-{'='*60}
-  {'':>20} {'Zonder':>12} {'Met Trail':>12} {'Verschil':>12}
-  {'WR':>20} {f"{r1['wr']}%":>12} {f"{r2['wr']}%":>12} {f"{r2['wr']-r1['wr']:+.1f}%":>12}
-  {'PF':>20} {f"{r1['pf']}":>12} {f"{r2['pf']}":>12} {f"{r2['pf']-r1['pf']:+.2f}":>12}
-  {'Return':>20} {f"+{r1['return']:.0f}%":>12} {f"+{r2['return']:.0f}%":>12} {f"{r2['return']-r1['return']:+.1f}%":>12}
-  {'Net PnL':>20} {f"${r1['pnl']:+,.0f}":>12} {f"${r2['pnl']:+,.0f}":>12} {f"${r2['pnl']-r1['pnl']:+,.0f}":>12}
-  {'Trades':>20} {f"{r1['trades']}":>12} {f"{r2['trades']}":>12} {f"{r2['trades']-r1['trades']:+d}":>12}
-  {'Max DD':>20} {f"{r1['dd']}%":>12} {f"{r2['dd']}%":>12} {f"{r2['dd']-r1['dd']:+.1f}%":>12}
-  {'Avg Win':>20} {f"${r1['avg_win']}":>12} {f"${r2['avg_win']}":>12} {f"${r2['avg_win']-r1['avg_win']:+.2f}":>12}
-  {'$50+ trades':>20} {f"{r1['big_50']}":>12} {f"{r2['big_50']}":>12} {f"{r2['big_50']-r1['big_50']:+d}":>12}
-  {'$100+ trades':>20} {f"{r1['big_100']}":>12} {f"{r2['big_100']}":>12} {f"{r2['big_100']-r1['big_100']:+d}":>12}
-  {'Runners':>20} {'N/A':>12} {f"{r2['runners']}":>12} {'':>12}
-  {'Best Runner':>20} {'N/A':>12} {f"${r2['best_runner']:+,.0f}":>12} {'':>12}
+  Avg per dag:    ${r['avg_daily']:>+8.2f}
+  Mediaan dag:    ${r['median_day']:>+8.2f}
+  Beste dag:      ${r['best_day']:>+8.2f}
+  Slechtste dag:  ${r['worst_day']:>+8.2f}
 
-  {'✅ TRAILING WINT!' if r2['pnl'] > r1['pnl'] else '⚠️ TRAILING HELPT NIET — houd v1.5 zonder trail'}
-{'='*60}""")
+  Trading dagen:  {r['trading_days']:>8}
+  Groene dagen:   {r['green_days']:>8} ({r['green_pct']:.0f}%)
+  Rode dagen:     {r['red_days']:>8}
+  $50+ dagen:     {r['days_50']:>8}
+  $100+ dagen:    {r['days_100']:>8}
+  $200+ dagen:    {r['days_200']:>8}
+
+  Dagelijks overzicht:""")
+
+        # Show each day
+        for day, pnl in sorted(r["daily_pnls"].items()):
+            bars = "█" * min(int(abs(pnl) / 10), 30)
+            emoji = "🟢" if pnl > 0 else "🔴"
+            target = " ← $100+" if pnl >= 100 else " ← $200+!" if pnl >= 200 else ""
+            print(f"    {emoji} {day}: ${pnl:>+8.2f} {bars}{target}")
+
+    # Recommendation
+    best = sorted(results, key=lambda x: x["avg_daily"], reverse=True)[0]
+
+    # Find best for $100/day target
+    target_100 = [r for r in results if r["days_100"] >= 5 and r["dd"] < 8]
+    target_100.sort(key=lambda x: x["days_100"], reverse=True)
+
+    print(f"""
+{'='*80}
+  ⭐ AANBEVELINGEN
+{'='*80}
+
+  🏆 HOOGSTE DAGELIJKSE WINST: {best['label']}
+     ${best['avg_daily']:+.2f}/dag | {best['days_100']} dagen $100+ | DD: {best['dd']:.1f}%
+
+  🎯 VOOR $100/DAG TARGET:""")
+
+    if target_100:
+        t = target_100[0]
+        print(f"     {t['label']} → {t['days_100']} dagen ≥$100 van {t['trading_days']} dagen")
+        print(f"     Risk: {t['risk']}% | WR: {t['wr']}% | PF: {t['pf']}")
+    else:
+        print(f"     ⚠️ Geen config haalt consistent $100/dag met <8% DD")
+        print(f"     Groei je account naar $10,000+ voor dit target")
+
+    print(f"""
+  📈 GROEI PROJECTIE (met {best['label']}):
+     Maand 1: $5,000 → ${5000 + best['avg_daily']*22:,.0f}
+     Maand 2: → ${5000 + best['avg_daily']*44:,.0f}
+     Maand 3: → ${5000 + best['avg_daily']*66:,.0f}
+     (zonder compound effect)
+
+  💡 MET COMPOUND (winst herbelegd):
+     Maand 1: ${5000 * (1 + best['return_pct']/100 * 22/len(max(best['daily_pnls'],default={'a':1})))**1:,.0f}
+     Let op: compound versnelt maar risico groeit mee
+
+{'='*80}""")
+
+    # Save
+    output = {
+        "results": [{k:v for k,v in r.items() if k != "daily_pnls"} for r in results],
+        "recommendation": best["label"],
+    }
+    with open("daily_profit_analysis.json","w") as f:
+        json.dump(output, f, indent=2)
+    print(f"  📁 Saved: daily_profit_analysis.json")
 
 
 if __name__ == "__main__":
