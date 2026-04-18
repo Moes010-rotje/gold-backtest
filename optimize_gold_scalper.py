@@ -1,16 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     XAUUSD GOLD SCALPER — DAILY PROFIT ANALYZER             ║
-║  Target: $100-200 per dag consistent                         ║
-║  Test: Risk levels, extra indicators, strategiewijzigingen   ║
+║     XAUUSD GOLD SCALPER — WEEKLY PERFORMANCE ANALYZER       ║
+║  Elke week apart: WR, PnL, trades, beste/slechtste dag      ║
+║  + Automatisch verbeteringen vinden voor consistentie        ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
-import sys, json, time
+import sys, json, time, math
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
 from enum import Enum
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 try:
     import pandas as pd
@@ -30,16 +31,15 @@ class Direction(Enum):
 class TradePhase(Enum):
     OPEN = "open"
     TP1_HIT = "tp1_hit"
-    CLOSED = "closed"
 
 
 @dataclass
 class Config:
-    LABEL: str = "v1.5 Base"
+    LABEL: str = "v1.5.1"
     START_BALANCE: float = 5000.0
     COMMISSION_PER_LOT: float = 7.0
     SIMULATED_SPREAD: float = 0.30
-    RISK_PERCENT: float = 0.5
+    RISK_PERCENT: float = 1.0
     MAX_DAILY_LOSS_PERCENT: float = 3.0
     MAX_TOTAL_DRAWDOWN_PERCENT: float = 10.0
     MAX_CONCURRENT_TRADES: int = 3
@@ -63,53 +63,52 @@ class Config:
     MIN_CONFLUENCE: int = 3
     TRADE_COOLDOWN_BARS: int = 5
     LOSS_COOLDOWN_BARS: int = 12
-
+    ADX_THRESHOLD: float = 25.0
     SWEEP_WICK_ATR_MIN: float = 0.25
     FVG_MIN_ATR: float = 0.25
     DOUBLE_TOLERANCE_ATR: float = 0.3
-    ADX_THRESHOLD: float = 25.0
 
-    # Extra toggles
-    USE_MACD: bool = False
-    USE_STOCH: bool = False
-    USE_EMA50_FILTER: bool = False
-    USE_HIGHER_TF_TREND: bool = False
+    # Regime filter
+    USE_REGIME_FILTER: bool = False
+    REGIME_ATR_LOOKBACK: int = 50
+    REGIME_LOW_VOL_MULT: float = 0.6
+
+    # Session bias
+    USE_SESSION_BIAS: bool = False
+    LONDON_BIAS_WEIGHT: float = 1.0
+    NY_BIAS_WEIGHT: float = 1.0
+
+    # Consecutive loss pause
+    USE_LOSS_PAUSE: bool = False
+    LOSS_PAUSE_THRESHOLD: int = 3
+    LOSS_PAUSE_BARS: int = 60
 
 
 def calculate_indicators(df):
     df = df.copy()
     df["ema9"] = df["Close"].ewm(span=9).mean()
     df["ema21"] = df["Close"].ewm(span=21).mean()
-    df["ema50"] = df["Close"].ewm(span=50).mean()
     df["tr"] = np.maximum(df["High"]-df["Low"], np.maximum(abs(df["High"]-df["Close"].shift(1)), abs(df["Low"]-df["Close"].shift(1))))
     df["atr"] = df["tr"].rolling(14).mean()
-
-    # RSI 7
+    df["atr50"] = df["tr"].rolling(50).mean()
     d = df["Close"].diff()
     g = d.clip(lower=0).rolling(7).mean()
     l = (-d.clip(upper=0)).rolling(7).mean()
     rs = g / l.replace(0, np.nan)
     df["rsi"] = 100 - (100/(1+rs))
-
-    # RSI 14
     d14 = df["Close"].diff()
     g14 = d14.clip(lower=0).rolling(14).mean()
     l14 = (-d14.clip(upper=0)).rolling(14).mean()
     rs14 = g14 / l14.replace(0, np.nan)
     df["rsi14"] = 100 - (100/(1+rs14))
-
-    # BB
     df["bb_mid"] = df["Close"].rolling(20).mean()
     df["bb_std"] = df["Close"].rolling(20).std()
     df["bb_upper"] = df["bb_mid"] + 2*df["bb_std"]
     df["bb_lower"] = df["bb_mid"] - 2*df["bb_std"]
-
-    # Candle
     df["body"] = abs(df["Close"]-df["Open"])
     df["candle_range"] = df["High"]-df["Low"]
     df["upper_wick"] = df["High"] - df[["Close","Open"]].max(axis=1)
     df["lower_wick"] = df[["Close","Open"]].min(axis=1) - df["Low"]
-
     # ADX
     plus_dm = df["High"].diff()
     minus_dm = -df["Low"].diff()
@@ -120,23 +119,8 @@ def calculate_indicators(df):
     minus_di = 100 * (minus_dm.rolling(14).mean() / atr14.replace(0, np.nan))
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
     df["adx"] = dx.rolling(14).mean()
-
-    # MACD
-    ema12 = df["Close"].ewm(span=12).mean()
-    ema26 = df["Close"].ewm(span=26).mean()
-    df["macd"] = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
-
-    # Stochastic
-    low14 = df["Low"].rolling(14).min()
-    high14 = df["High"].rolling(14).max()
-    df["stoch_k"] = ((df["Close"] - low14) / (high14 - low14).replace(0, np.nan)) * 100
-    df["stoch_d"] = df["stoch_k"].rolling(3).mean()
-
-    # Higher TF trend (EMA50 slope)
-    df["ema50_slope"] = df["ema50"] - df["ema50"].shift(10)
-
+    # Trend direction (EMA slope over 20 bars)
+    df["trend_slope"] = df["ema21"] - df["ema21"].shift(20)
     return df
 
 
@@ -160,10 +144,24 @@ def detect_signal(df, i, cfg, swing_highs, swing_lows):
     ts = df.index[i]
     if not hasattr(ts, 'hour') or not (7 <= ts.hour < 17): return None
 
+    # Regime filter: skip low volatility
+    if cfg.USE_REGIME_FILTER:
+        atr50 = df["atr50"].iloc[i]
+        if not pd.isna(atr50) and atr50 > 0:
+            if atr < atr50 * cfg.REGIME_LOW_VOL_MULT:
+                return None
+
     confluence = 0; reasons = []
     votes = {Direction.LONG: 0, Direction.SHORT: 0}
     ch, cl, cc, co = df["High"].iloc[i], df["Low"].iloc[i], df["Close"].iloc[i], df["Open"].iloc[i]
     body, total = df["body"].iloc[i], df["candle_range"].iloc[i]
+
+    # Determine session for bias
+    hour = ts.hour
+    session_weight = 1.0
+    if cfg.USE_SESSION_BIAS:
+        if 7 <= hour < 12: session_weight = cfg.LONDON_BIAS_WEIGHT
+        elif 12 <= hour < 17: session_weight = cfg.NY_BIAS_WEIGHT
 
     # 1. EMA
     if ema9 > ema21: votes[Direction.LONG] += 1; reasons.append("ema")
@@ -232,37 +230,6 @@ def detect_signal(df, i, cfg, swing_highs, swing_lows):
     if not pd.isna(adx) and adx >= cfg.ADX_THRESHOLD:
         confluence += 1; reasons.append("adx")
 
-    # 10. MACD (extra)
-    if cfg.USE_MACD:
-        macd_h = df["macd_hist"].iloc[i]
-        macd_h_prev = df["macd_hist"].iloc[i-1]
-        if not pd.isna(macd_h) and not pd.isna(macd_h_prev):
-            if macd_h > 0 and macd_h > macd_h_prev: votes[Direction.LONG] += 1; reasons.append("macd")
-            elif macd_h < 0 and macd_h < macd_h_prev: votes[Direction.SHORT] += 1; reasons.append("macd")
-
-    # 11. Stochastic (extra)
-    if cfg.USE_STOCH:
-        stk = df["stoch_k"].iloc[i]
-        std = df["stoch_d"].iloc[i]
-        if not pd.isna(stk) and not pd.isna(std):
-            if stk < 20 and stk > std: votes[Direction.LONG] += 1; reasons.append("stoch")
-            elif stk > 80 and stk < std: votes[Direction.SHORT] += 1; reasons.append("stoch")
-
-    # 12. EMA50 filter (extra)
-    if cfg.USE_EMA50_FILTER:
-        ema50 = df["ema50"].iloc[i]
-        if not pd.isna(ema50):
-            if price > ema50 and ema9 > ema50: votes[Direction.LONG] += 1; reasons.append("ema50")
-            elif price < ema50 and ema9 < ema50: votes[Direction.SHORT] += 1; reasons.append("ema50")
-
-    # 13. Higher TF trend (extra)
-    if cfg.USE_HIGHER_TF_TREND:
-        slope = df["ema50_slope"].iloc[i]
-        if not pd.isna(slope):
-            if slope > 0: votes[Direction.LONG] += 1; reasons.append("htf")
-            elif slope < 0: votes[Direction.SHORT] += 1; reasons.append("htf")
-
-    # Direction
     ls, ss = votes[Direction.LONG], votes[Direction.SHORT]
     if ls > ss and ls >= 1: direction = Direction.LONG; confluence += ls
     elif ss > ls and ss >= 1: direction = Direction.SHORT; confluence += ss
@@ -277,9 +244,9 @@ def detect_signal(df, i, cfg, swing_highs, swing_lows):
 @dataclass
 class Trade:
     direction: Direction; entry: float; sl: float; tp: float; tp1: float
-    lots: float; bar: int; sl_dist: float; day: str = ""
-    phase: TradePhase = TradePhase.OPEN
-    pnl: float = 0.0; remaining: float = 0.0
+    lots: float; bar: int; sl_dist: float; day: str = ""; hour: int = 0
+    phase: TradePhase = TradePhase.OPEN; pnl: float = 0.0; remaining: float = 0.0
+    reasons: str = ""
     def __post_init__(self): self.remaining = self.lots
 
 
@@ -287,7 +254,7 @@ def run_backtest(df, cfg, sh, sl):
     balance = cfg.START_BALANCE; peak = balance; max_dd = 0.0
     active, closed = [], []; daily_trades = 0; daily_date = ""
     consec_losses = 0; ltb = -999; llb = -999
-    daily_pnl_tracker: Dict[str, float] = {}
+    loss_pause_until = -999
 
     for i in range(60, len(df)):
         price, high, low = df["Close"].iloc[i], df["High"].iloc[i], df["Low"].iloc[i]
@@ -296,18 +263,18 @@ def run_backtest(df, cfg, sh, sl):
         ts = df.index[i]
         today = str(ts.date()) if hasattr(ts,'date') else str(ts)[:10]
         if today != daily_date: daily_date = today; daily_trades = 0
-        if today not in daily_pnl_tracker: daily_pnl_tracker[today] = 0.0
 
         for t in list(active):
             if (t.direction==Direction.LONG and low<=t.sl) or (t.direction==Direction.SHORT and high>=t.sl):
                 t.pnl += ((t.sl-t.entry) if t.direction==Direction.LONG else (t.entry-t.sl))*t.remaining*100
                 t.pnl -= cfg.COMMISSION_PER_LOT*t.remaining; balance += t.pnl
-                daily_pnl_tracker[today] += t.pnl
-                consec_losses += 1; llb = i; active.remove(t); closed.append(t); continue
+                consec_losses += 1; llb = i; active.remove(t); closed.append(t)
+                if cfg.USE_LOSS_PAUSE and consec_losses >= cfg.LOSS_PAUSE_THRESHOLD:
+                    loss_pause_until = i + cfg.LOSS_PAUSE_BARS
+                continue
             if (t.direction==Direction.LONG and high>=t.tp) or (t.direction==Direction.SHORT and low<=t.tp):
                 t.pnl += ((t.tp-t.entry) if t.direction==Direction.LONG else (t.entry-t.tp))*t.remaining*100
                 t.pnl -= cfg.COMMISSION_PER_LOT*t.remaining; balance += t.pnl
-                daily_pnl_tracker[today] += t.pnl
                 consec_losses = 0; active.remove(t); closed.append(t); continue
             if t.phase == TradePhase.OPEN:
                 if (t.direction==Direction.LONG and high>=t.tp1) or (t.direction==Direction.SHORT and low<=t.tp1):
@@ -315,7 +282,6 @@ def run_backtest(df, cfg, sh, sl):
                     if cl >= 0.01:
                         p = ((t.tp1-t.entry) if t.direction==Direction.LONG else (t.entry-t.tp1))*cl*100
                         p -= cfg.COMMISSION_PER_LOT*cl; balance += p; t.pnl += p
-                        daily_pnl_tracker[today] += p
                         t.remaining = round(t.remaining-cl, 2); t.phase = TradePhase.TP1_HIT
                         if cfg.MOVE_SL_TO_BE: t.sl = t.entry
 
@@ -331,6 +297,7 @@ def run_backtest(df, cfg, sh, sl):
             consec_losses = 0
         if i-ltb < cfg.TRADE_COOLDOWN_BARS: continue
         if i-llb < cfg.LOSS_COOLDOWN_BARS: continue
+        if cfg.USE_LOSS_PAUSE and i < loss_pause_until: continue
         if (cfg.START_BALANCE-balance)/cfg.START_BALANCE*100 >= cfg.MAX_TOTAL_DRAWDOWN_PERCENT: continue
 
         signal = detect_signal(df, i, cfg, sh, sl)
@@ -347,67 +314,61 @@ def run_backtest(df, cfg, sh, sl):
 
         lots = max(0.01, min(round((balance*cfg.RISK_PERCENT/100)/(sl_dist*100), 2), 0.5))
         trade = Trade(direction=direction, entry=entry, sl=s, tp=t, tp1=t1,
-                      lots=lots, bar=i, sl_dist=sl_dist, day=today)
+                      lots=lots, bar=i, sl_dist=sl_dist, day=today,
+                      hour=ts.hour if hasattr(ts,'hour') else 0, reasons=reason)
         active.append(trade)
         daily_trades += 1; ltb = i
 
-    # Close remaining
     if active:
         lp = df["Close"].iloc[-1]
         for t in active:
             t.pnl += ((lp-t.entry) if t.direction==Direction.LONG else (t.entry-lp))*t.remaining*100
-            today = t.day
-            if today in daily_pnl_tracker: daily_pnl_tracker[today] += t.pnl
             closed.append(t)
 
-    if not closed: return None
+    return closed, balance, max_dd
 
-    wins = [t for t in closed if t.pnl > 0]
-    losses = [t for t in closed if t.pnl <= 0]
-    tw = sum(t.pnl for t in wins); tl = abs(sum(t.pnl for t in losses))
-    wr = len(wins)/len(closed)*100
-    pf = tw/tl if tl > 0 else 99
-    net = balance - cfg.START_BALANCE
 
-    # Daily stats
-    trading_days = [d for d, p in daily_pnl_tracker.items() if abs(p) > 0.01]
-    daily_pnls = [daily_pnl_tracker[d] for d in trading_days]
-    green_days = [p for p in daily_pnls if p > 0]
-    red_days = [p for p in daily_pnls if p <= 0]
-    days_100 = [p for p in daily_pnls if p >= 100]
-    days_200 = [p for p in daily_pnls if p >= 200]
-    days_50 = [p for p in daily_pnls if p >= 50]
+def analyze_weekly(closed, cfg):
+    """Break down trades by week."""
+    weekly = defaultdict(lambda: {"trades":0,"wins":0,"losses":0,"pnl":0.0,"days":set(),"long_w":0,"long_l":0,"short_w":0,"short_l":0,"signals":defaultdict(int),"hourly_pnl":defaultdict(float)})
 
-    return {
-        "label": cfg.LABEL,
-        "risk": cfg.RISK_PERCENT,
-        "trades": len(closed), "wr": round(wr,1), "pf": round(pf,2),
-        "pnl": round(net,2), "dd": round(max_dd,2),
-        "return_pct": round(net/cfg.START_BALANCE*100,2),
-        "balance": round(balance,2),
-        "avg_win": round(tw/max(len(wins),1),2),
-        "avg_loss": round(tl/max(len(losses),1),2),
-        "trading_days": len(trading_days),
-        "green_days": len(green_days),
-        "red_days": len(red_days),
-        "green_pct": round(len(green_days)/max(len(trading_days),1)*100,1),
-        "avg_daily": round(sum(daily_pnls)/max(len(trading_days),1),2),
-        "best_day": round(max(daily_pnls, default=0),2),
-        "worst_day": round(min(daily_pnls, default=0),2),
-        "days_50": len(days_50),
-        "days_100": len(days_100),
-        "days_200": len(days_200),
-        "median_day": round(np.median(daily_pnls),2) if daily_pnls else 0,
-        "daily_pnls": {d: round(p,2) for d, p in sorted(daily_pnl_tracker.items()) if abs(p) > 0.01},
-    }
+    for t in closed:
+        try:
+            dt = datetime.strptime(t.day, "%Y-%m-%d")
+            # ISO week
+            yr, wk, _ = dt.isocalendar()
+            week_key = f"{yr}-W{wk:02d}"
+            monday = dt - timedelta(days=dt.weekday())
+            week_label = f"{week_key} ({monday.strftime('%d %b')})"
+        except:
+            week_label = "unknown"
+
+        w = weekly[week_label]
+        w["trades"] += 1
+        w["pnl"] += t.pnl
+        w["days"].add(t.day)
+        w["hourly_pnl"][t.hour] += t.pnl
+
+        for r in t.reasons.split("|"):
+            if r: w["signals"][r] += 1
+
+        if t.pnl > 0:
+            w["wins"] += 1
+            if t.direction == Direction.LONG: w["long_w"] += 1
+            else: w["short_w"] += 1
+        else:
+            w["losses"] += 1
+            if t.direction == Direction.LONG: w["long_l"] += 1
+            else: w["short_l"] += 1
+
+    return dict(weekly)
 
 
 def main():
     print("""
 ╔══════════════════════════════════════════════════════════════╗
-║     XAUUSD GOLD SCALPER — DAILY PROFIT ANALYZER             ║
-║     🎯 Target: $100-200 per dag consistent                  ║
-║     Test: Risk levels + extra indicators                     ║
+║     XAUUSD GOLD SCALPER — WEEKLY PERFORMANCE ANALYZER       ║
+║     🎯 Elke week apart + verbeteringen vinden               ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
     print("📥 Downloading 60-day gold data...")
@@ -421,164 +382,254 @@ def main():
 
     df = calculate_indicators(df)
     sh, sl = detect_swings(df, 3)
+    start_time = time.time()
 
     # ═══════════════════════════════════════════════════════════
-    #  TEST SUITE
+    #  PHASE 1: BASELINE WEEKLY BREAKDOWN
     # ═══════════════════════════════════════════════════════════
+    print(f"\n{'='*70}")
+    print(f"  📊 PHASE 1: v1.5.1 BASELINE — WEEKLY BREAKDOWN")
+    print(f"{'='*70}")
 
-    tests = []
+    cfg = Config()
+    closed, final_bal, max_dd = run_backtest(df, cfg, sh, sl)
+    weekly = analyze_weekly(closed, cfg)
 
-    # 1. Risk level comparison
-    for risk in [0.5, 0.75, 1.0, 1.5, 2.0]:
-        cfg = Config()
-        cfg.LABEL = f"Risk {risk}%"
-        cfg.RISK_PERCENT = risk
-        if risk >= 1.5: cfg.MAX_DAILY_LOSS_PERCENT = 5.0
-        if risk >= 2.0: cfg.MAX_TOTAL_DRAWDOWN_PERCENT = 15.0
-        tests.append(cfg)
+    wins = [t for t in closed if t.pnl > 0]
+    losses = [t for t in closed if t.pnl <= 0]
+    tw = sum(t.pnl for t in wins); tl = abs(sum(t.pnl for t in losses))
+    total_wr = len(wins)/max(len(closed),1)*100
+    total_pf = tw/tl if tl > 0 else 99
 
-    # 2. Risk 1% + MACD extra confluence
-    cfg = Config(); cfg.LABEL = "1% + MACD"; cfg.RISK_PERCENT = 1.0; cfg.USE_MACD = True
-    tests.append(cfg)
+    print(f"\n  TOTAAL: {len(closed)} trades | WR:{total_wr:.1f}% | PF:{total_pf:.2f} | ${final_bal-cfg.START_BALANCE:+,.0f} | DD:{max_dd:.1f}%\n")
 
-    # 3. Risk 1% + Stochastic
-    cfg = Config(); cfg.LABEL = "1% + Stoch"; cfg.RISK_PERCENT = 1.0; cfg.USE_STOCH = True
-    tests.append(cfg)
+    green_weeks = 0; red_weeks = 0
+    worst_week = None; best_week = None
 
-    # 4. Risk 1% + EMA50 filter
-    cfg = Config(); cfg.LABEL = "1% + EMA50"; cfg.RISK_PERCENT = 1.0; cfg.USE_EMA50_FILTER = True
-    tests.append(cfg)
+    print(f"  {'Week':<25} {'Trades':>7} {'WR':>6} {'PnL':>10} {'Long W/L':>10} {'Short W/L':>10} {'Days':>5}")
+    print(f"  {'-'*75}")
 
-    # 5. Risk 1% + Higher TF trend
-    cfg = Config(); cfg.LABEL = "1% + HTF"; cfg.RISK_PERCENT = 1.0; cfg.USE_HIGHER_TF_TREND = True
-    tests.append(cfg)
+    for week in sorted(weekly.keys()):
+        w = weekly[week]
+        wr = w["wins"]/max(w["trades"],1)*100
+        emoji = "🟢" if w["pnl"] >= 0 else "🔴"
+        if w["pnl"] >= 0: green_weeks += 1
+        else: red_weeks += 1
+        if worst_week is None or w["pnl"] < weekly.get(worst_week,{}).get("pnl",0): worst_week = week
+        if best_week is None or w["pnl"] > weekly.get(best_week,{}).get("pnl",0): best_week = week
 
-    # 6. Risk 1% + ALL extra indicators
-    cfg = Config(); cfg.LABEL = "1% + ALL EXTRA"; cfg.RISK_PERCENT = 1.0
-    cfg.USE_MACD = True; cfg.USE_STOCH = True; cfg.USE_EMA50_FILTER = True; cfg.USE_HIGHER_TF_TREND = True
-    tests.append(cfg)
+        long_str = f"{w['long_w']}/{w['long_l']}"
+        short_str = f"{w['short_w']}/{w['short_l']}"
+        print(f"  {emoji} {week:<23} {w['trades']:>7} {wr:>5.0f}% ${w['pnl']:>+9,.0f} {long_str:>10} {short_str:>10} {len(w['days']):>5}")
 
-    # 7. Risk 1% + Confluence 4 (stricter)
-    cfg = Config(); cfg.LABEL = "1% Conf≥4"; cfg.RISK_PERCENT = 1.0; cfg.MIN_CONFLUENCE = 4
-    tests.append(cfg)
+    print(f"\n  Groene weken: {green_weeks} | Rode weken: {red_weeks} | Win%: {green_weeks/max(green_weeks+red_weeks,1)*100:.0f}%")
 
-    # 8. Risk 1% + Max 4 concurrent
-    cfg = Config(); cfg.LABEL = "1% Max4 Open"; cfg.RISK_PERCENT = 1.0; cfg.MAX_CONCURRENT_TRADES = 4
-    tests.append(cfg)
+    # Analyze worst week
+    if worst_week:
+        ww = weekly[worst_week]
+        print(f"\n  📉 SLECHTSTE WEEK: {worst_week}")
+        print(f"     PnL: ${ww['pnl']:+,.2f} | WR: {ww['wins']/max(ww['trades'],1)*100:.0f}%")
+        print(f"     Signalen: {dict(ww['signals'])}")
+        print(f"     Uur-analyse:")
+        for h in sorted(ww["hourly_pnl"].keys()):
+            hp = ww["hourly_pnl"][h]
+            emoji = "🟢" if hp >= 0 else "🔴"
+            print(f"       {emoji} {h:02d}:00 UTC: ${hp:+.2f}")
 
-    # 9. Risk 1% + Shorter cooldowns
-    cfg = Config(); cfg.LABEL = "1% Fast CD"; cfg.RISK_PERCENT = 1.0
-    cfg.TRADE_COOLDOWN_BARS = 3; cfg.LOSS_COOLDOWN_BARS = 5
-    tests.append(cfg)
+    if best_week:
+        bw = weekly[best_week]
+        print(f"\n  📈 BESTE WEEK: {best_week}")
+        print(f"     PnL: ${bw['pnl']:+,.2f} | WR: {bw['wins']/max(bw['trades'],1)*100:.0f}%")
+        print(f"     Signalen: {dict(bw['signals'])}")
 
-    # 10. Risk 1% + ALL extras + Conf 4 (quality + volume)
-    cfg = Config(); cfg.LABEL = "1% QUALITY MAX"; cfg.RISK_PERCENT = 1.0
-    cfg.USE_MACD = True; cfg.USE_STOCH = True; cfg.MIN_CONFLUENCE = 4
-    tests.append(cfg)
+    # Overall session analysis
+    print(f"\n  📊 SESSIE ANALYSE (alle weken):")
+    hourly_pnl = defaultdict(float)
+    hourly_trades = defaultdict(int)
+    hourly_wins = defaultdict(int)
+    for t in closed:
+        hourly_pnl[t.hour] += t.pnl
+        hourly_trades[t.hour] += 1
+        if t.pnl > 0: hourly_wins[t.hour] += 1
 
-    # Run all tests
-    results = []
-    print(f"\n  Running {len(tests)} configurations...\n")
+    for h in sorted(hourly_pnl.keys()):
+        wr = hourly_wins[h]/max(hourly_trades[h],1)*100
+        emoji = "🟢" if hourly_pnl[h] >= 0 else "🔴"
+        session = "London" if 7 <= h < 12 else "NY Overlap" if 12 <= h < 15 else "New York" if 15 <= h < 17 else "Off"
+        print(f"    {emoji} {h:02d}:00 ({session:>11}): {hourly_trades[h]:>4}t | WR:{wr:>5.0f}% | ${hourly_pnl[h]:>+9,.0f}")
 
-    for i, cfg in enumerate(tests):
-        print(f"  [{i+1}/{len(tests)}] {cfg.LABEL}...")
-        r = run_backtest(df, cfg, sh, sl)
-        if r:
-            results.append(r)
-            print(f"       WR:{r['wr']}% | PF:{r['pf']} | Avg/day:${r['avg_daily']:+.0f} | "
-                  f"$100+ days:{r['days_100']} | DD:{r['dd']:.1f}%")
+    # Signal performance
+    print(f"\n  📊 SIGNAAL PERFORMANCE:")
+    signal_pnl = defaultdict(float)
+    signal_count = defaultdict(int)
+    signal_wins = defaultdict(int)
+    for t in closed:
+        for r in t.reasons.split("|"):
+            if r:
+                signal_pnl[r] += t.pnl
+                signal_count[r] += 1
+                if t.pnl > 0: signal_wins[r] += 1
+
+    for sig in sorted(signal_pnl.keys(), key=lambda x: signal_pnl[x], reverse=True):
+        wr = signal_wins[sig]/max(signal_count[sig],1)*100
+        emoji = "🟢" if signal_pnl[sig] >= 0 else "🔴"
+        print(f"    {emoji} {sig:<10}: {signal_count[sig]:>5}t | WR:{wr:>5.0f}% | ${signal_pnl[sig]:>+9,.0f}")
+
+    # Direction analysis per week
+    total_long = sum(1 for t in closed if t.direction == Direction.LONG)
+    total_short = sum(1 for t in closed if t.direction == Direction.SHORT)
+    long_pnl = sum(t.pnl for t in closed if t.direction == Direction.LONG)
+    short_pnl = sum(t.pnl for t in closed if t.direction == Direction.SHORT)
+    long_wr = sum(1 for t in closed if t.direction == Direction.LONG and t.pnl > 0)/max(total_long,1)*100
+    short_wr = sum(1 for t in closed if t.direction == Direction.SHORT and t.pnl > 0)/max(total_short,1)*100
+
+    print(f"\n  📊 RICHTING:")
+    print(f"    Long:  {total_long} trades | WR:{long_wr:.0f}% | ${long_pnl:+,.0f}")
+    print(f"    Short: {total_short} trades | WR:{short_wr:.0f}% | ${short_pnl:+,.0f}")
 
     # ═══════════════════════════════════════════════════════════
-    #  RESULTS
+    #  PHASE 2: TEST IMPROVEMENTS
     # ═══════════════════════════════════════════════════════════
+    print(f"\n{'='*70}")
+    print(f"  🔧 PHASE 2: VERBETERINGEN TESTEN")
+    print(f"{'='*70}")
 
-    print(f"\n{'='*80}")
-    print(f"  📊 DAILY PROFIT ANALYSIS — {len(results)} CONFIGURATIONS TESTED")
-    print(f"{'='*80}")
+    improvements = []
 
-    # Overview table
-    print(f"\n  {'Config':<20} {'Risk':>5} {'WR':>6} {'PF':>5} {'$/Day':>8} {'$100+':>6} {'$200+':>6} {'Green%':>7} {'DD':>6} {'Total':>10}")
-    print(f"  {'-'*85}")
-    for r in sorted(results, key=lambda x: x["avg_daily"], reverse=True):
-        print(f"  {r['label']:<20} {r['risk']:>4.1f}% {r['wr']:>5.1f}% {r['pf']:>4.2f} "
-              f"${r['avg_daily']:>+6.0f} {r['days_100']:>5}d {r['days_200']:>5}d "
-              f"{r['green_pct']:>5.0f}%  {r['dd']:>5.1f}% ${r['pnl']:>+9,.0f}")
+    # Test 1: Regime filter (skip low vol)
+    print(f"\n  Testing: Regime filter (skip lage volatiliteit)...")
+    for low_mult in [0.5, 0.6, 0.7]:
+        cfg2 = Config(); cfg2.USE_REGIME_FILTER = True; cfg2.REGIME_LOW_VOL_MULT = low_mult
+        cfg2.LABEL = f"Regime {low_mult}"
+        c2, b2, d2 = run_backtest(df, cfg2, sh, sl)
+        w2 = [t for t in c2 if t.pnl > 0]
+        l2 = [t for t in c2 if t.pnl <= 0]
+        wr2 = len(w2)/max(len(c2),1)*100
+        pf2 = sum(t.pnl for t in w2)/max(abs(sum(t.pnl for t in l2)),0.01)
+        pnl2 = b2 - cfg2.START_BALANCE
+        improvements.append({"label":cfg2.LABEL,"trades":len(c2),"wr":wr2,"pf":round(pf2,2),"pnl":round(pnl2,2),"dd":round(d2,2)})
+        print(f"    {cfg2.LABEL}: {len(c2)}t | WR:{wr2:.1f}% | PF:{pf2:.2f} | ${pnl2:+,.0f} | DD:{d2:.1f}%")
 
-    # Detailed daily breakdown for top 3
-    top3 = sorted(results, key=lambda x: x["avg_daily"], reverse=True)[:3]
+    # Test 2: Loss pause (langere pauze na 3 verliezen)
+    print(f"\n  Testing: Loss pause na 3 verliezen...")
+    for pause in [30, 60, 120]:
+        cfg2 = Config(); cfg2.USE_LOSS_PAUSE = True; cfg2.LOSS_PAUSE_BARS = pause
+        cfg2.LABEL = f"Pause {pause}bars"
+        c2, b2, d2 = run_backtest(df, cfg2, sh, sl)
+        w2 = [t for t in c2 if t.pnl > 0]; l2 = [t for t in c2 if t.pnl <= 0]
+        wr2 = len(w2)/max(len(c2),1)*100
+        pf2 = sum(t.pnl for t in w2)/max(abs(sum(t.pnl for t in l2)),0.01)
+        pnl2 = b2 - cfg2.START_BALANCE
+        improvements.append({"label":cfg2.LABEL,"trades":len(c2),"wr":wr2,"pf":round(pf2,2),"pnl":round(pnl2,2),"dd":round(d2,2)})
+        print(f"    {cfg2.LABEL}: {len(c2)}t | WR:{wr2:.1f}% | PF:{pf2:.2f} | ${pnl2:+,.0f} | DD:{d2:.1f}%")
 
-    for r in top3:
-        print(f"\n  {'='*60}")
-        print(f"  📅 DAILY BREAKDOWN: {r['label']}")
-        print(f"  {'='*60}")
+    # Test 3: Skip bad hours
+    bad_hours = [h for h in hourly_pnl if hourly_pnl[h] < -50]
+    if bad_hours:
+        print(f"\n  Testing: Skip slechte uren {bad_hours}...")
+        # Create version that skips bad hours
+        cfg2 = Config(); cfg2.LABEL = f"Skip uren {bad_hours}"
+        # We need custom signal detection for this, simulate by filtering
+        c2_all, b2, d2 = run_backtest(df, cfg2, sh, sl)
+        c2 = [t for t in c2_all if t.hour not in bad_hours]
+        # Recalculate balance
+        sim_bal = cfg2.START_BALANCE
+        for t in c2: sim_bal += t.pnl
+        w2 = [t for t in c2 if t.pnl > 0]; l2 = [t for t in c2 if t.pnl <= 0]
+        wr2 = len(w2)/max(len(c2),1)*100
+        pf2 = sum(t.pnl for t in w2)/max(abs(sum(t.pnl for t in l2)),0.01)
+        pnl2 = sum(t.pnl for t in c2)
+        improvements.append({"label":cfg2.LABEL,"trades":len(c2),"wr":wr2,"pf":round(pf2,2),"pnl":round(pnl2,2),"dd":round(d2,2)})
+        print(f"    {cfg2.LABEL}: {len(c2)}t | WR:{wr2:.1f}% | PF:{pf2:.2f} | ${pnl2:+,.0f}")
+
+    # Test 4: Different risk levels
+    print(f"\n  Testing: Risk levels...")
+    for risk in [0.75, 1.0, 1.5]:
+        cfg2 = Config(); cfg2.RISK_PERCENT = risk; cfg2.LABEL = f"Risk {risk}%"
+        c2, b2, d2 = run_backtest(df, cfg2, sh, sl)
+        w2 = [t for t in c2 if t.pnl > 0]; l2 = [t for t in c2 if t.pnl <= 0]
+        wr2 = len(w2)/max(len(c2),1)*100
+        pf2 = sum(t.pnl for t in w2)/max(abs(sum(t.pnl for t in l2)),0.01)
+        pnl2 = b2 - cfg2.START_BALANCE
+        improvements.append({"label":cfg2.LABEL,"trades":len(c2),"wr":wr2,"pf":round(pf2,2),"pnl":round(pnl2,2),"dd":round(d2,2)})
+        wk2 = analyze_weekly(c2, cfg2)
+        red = sum(1 for w in wk2.values() if w["pnl"] < 0)
+        print(f"    {cfg2.LABEL}: {len(c2)}t | WR:{wr2:.1f}% | PF:{pf2:.2f} | ${pnl2:+,.0f} | DD:{d2:.1f}% | {red} rode weken")
+
+    # Test 5: Confluence 4
+    print(f"\n  Testing: Hogere confluence...")
+    for conf in [4, 5]:
+        cfg2 = Config(); cfg2.MIN_CONFLUENCE = conf; cfg2.LABEL = f"Conf≥{conf}"
+        c2, b2, d2 = run_backtest(df, cfg2, sh, sl)
+        w2 = [t for t in c2 if t.pnl > 0]; l2 = [t for t in c2 if t.pnl <= 0]
+        wr2 = len(w2)/max(len(c2),1)*100
+        pf2 = sum(t.pnl for t in w2)/max(abs(sum(t.pnl for t in l2)),0.01)
+        pnl2 = b2 - cfg2.START_BALANCE
+        improvements.append({"label":cfg2.LABEL,"trades":len(c2),"wr":wr2,"pf":round(pf2,2),"pnl":round(pnl2,2),"dd":round(d2,2)})
+        print(f"    {cfg2.LABEL}: {len(c2)}t | WR:{wr2:.1f}% | PF:{pf2:.2f} | ${pnl2:+,.0f} | DD:{d2:.1f}%")
+
+    # ═══════════════════════════════════════════════════════════
+    #  PHASE 3: RANKED RESULTS
+    # ═══════════════════════════════════════════════════════════
+    baseline = {"label":"v1.5.1 CURRENT","trades":len(closed),"wr":round(total_wr,1),"pf":round(total_pf,2),
+                "pnl":round(final_bal-cfg.START_BALANCE,2),"dd":round(max_dd,2)}
+    all_results = [baseline] + improvements
+
+    print(f"\n{'='*70}")
+    print(f"  🏆 ALLE RESULTATEN GERANKT (op PnL)")
+    print(f"{'='*70}")
+    print(f"\n  {'Config':<25} {'Trades':>7} {'WR':>6} {'PF':>6} {'PnL':>10} {'DD':>6} {'vs Base':>10}")
+    print(f"  {'-'*72}")
+    for r in sorted(all_results, key=lambda x: x["pnl"], reverse=True):
+        diff = r["pnl"] - baseline["pnl"]
+        marker = " ⬅️ HUIDIG" if r["label"] == "v1.5.1 CURRENT" else ""
+        emoji = "🟢" if diff > 0 else "🔴" if diff < 0 else "⚪"
+        print(f"  {emoji} {r['label']:<23} {r['trades']:>7} {r['wr']:>5.1f}% {r['pf']:>5.2f} ${r['pnl']:>+9,.0f} {r['dd']:>5.1f}% ${diff:>+9,.0f}{marker}")
+
+    # Recommendations
+    better = [r for r in improvements if r["pnl"] > baseline["pnl"] and r["pf"] >= 1.0]
+    better.sort(key=lambda x: x["pnl"], reverse=True)
+
+    print(f"\n{'='*70}")
+    print(f"  ⭐ AANBEVELINGEN")
+    print(f"{'='*70}")
+
+    if better:
+        best = better[0]
         print(f"""
-  Avg per dag:    ${r['avg_daily']:>+8.2f}
-  Mediaan dag:    ${r['median_day']:>+8.2f}
-  Beste dag:      ${r['best_day']:>+8.2f}
-  Slechtste dag:  ${r['worst_day']:>+8.2f}
-
-  Trading dagen:  {r['trading_days']:>8}
-  Groene dagen:   {r['green_days']:>8} ({r['green_pct']:.0f}%)
-  Rode dagen:     {r['red_days']:>8}
-  $50+ dagen:     {r['days_50']:>8}
-  $100+ dagen:    {r['days_100']:>8}
-  $200+ dagen:    {r['days_200']:>8}
-
-  Dagelijks overzicht:""")
-
-        # Show each day
-        for day, pnl in sorted(r["daily_pnls"].items()):
-            bars = "█" * min(int(abs(pnl) / 10), 30)
-            emoji = "🟢" if pnl > 0 else "🔴"
-            target = " ← $100+" if pnl >= 100 else " ← $200+!" if pnl >= 200 else ""
-            print(f"    {emoji} {day}: ${pnl:>+8.2f} {bars}{target}")
-
-    # Recommendation
-    best = sorted(results, key=lambda x: x["avg_daily"], reverse=True)[0]
-
-    # Find best for $100/day target
-    target_100 = [r for r in results if r["days_100"] >= 5 and r["dd"] < 8]
-    target_100.sort(key=lambda x: x["days_100"], reverse=True)
-
-    print(f"""
-{'='*80}
-  ⭐ AANBEVELINGEN
-{'='*80}
-
-  🏆 HOOGSTE DAGELIJKSE WINST: {best['label']}
-     ${best['avg_daily']:+.2f}/dag | {best['days_100']} dagen $100+ | DD: {best['dd']:.1f}%
-
-  🎯 VOOR $100/DAG TARGET:""")
-
-    if target_100:
-        t = target_100[0]
-        print(f"     {t['label']} → {t['days_100']} dagen ≥$100 van {t['trading_days']} dagen")
-        print(f"     Risk: {t['risk']}% | WR: {t['wr']}% | PF: {t['pf']}")
+  BESTE VERBETERING: {best['label']}
+  ├── PnL: ${baseline['pnl']:+,.0f} → ${best['pnl']:+,.0f} (${best['pnl']-baseline['pnl']:+,.0f} meer)
+  ├── WR: {baseline['wr']}% → {best['wr']}%
+  ├── PF: {baseline['pf']} → {best['pf']}
+  └── DD: {baseline['dd']}% → {best['dd']}%
+""")
     else:
-        print(f"     ⚠️ Geen config haalt consistent $100/dag met <8% DD")
-        print(f"     Groei je account naar $10,000+ voor dit target")
+        print(f"\n  ⚠️ Geen verbetering gevonden die beter is dan v1.5.1")
+        print(f"  De huidige strategie is al geoptimaliseerd.")
 
-    print(f"""
-  📈 GROEI PROJECTIE (met {best['label']}):
-     Maand 1: $5,000 → ${5000 + best['avg_daily']*22:,.0f}
-     Maand 2: → ${5000 + best['avg_daily']*44:,.0f}
-     Maand 3: → ${5000 + best['avg_daily']*66:,.0f}
-     (zonder compound effect)
+    # Weekly consistency advice
+    if red_weeks > 0:
+        red_week_data = [(w, weekly[w]) for w in sorted(weekly.keys()) if weekly[w]["pnl"] < 0]
+        print(f"\n  📅 RODE WEKEN ANALYSE ({red_weeks} van {green_weeks+red_weeks}):")
+        for wk, wd in red_week_data:
+            print(f"    🔴 {wk}: ${wd['pnl']:+,.0f} | {wd['trades']}t | WR:{wd['wins']/max(wd['trades'],1)*100:.0f}%")
+            print(f"       Signalen: {dict(wd['signals'])}")
+    else:
+        print(f"\n  ✅ ALLE WEKEN GROEN! Geen verbeteringen nodig.")
 
-  💡 MET COMPOUND (winst herbelegd):
-     Maand 1: ${5000 * (1 + best['return_pct']/100 * 22/len(max(best['daily_pnls'],default={'a':1})))**1:,.0f}
-     Let op: compound versnelt maar risico groeit mee
-
-{'='*80}""")
+    print(f"\n  ⏱️  Klaar in {time.time()-start_time:.0f}s")
 
     # Save
     output = {
-        "results": [{k:v for k,v in r.items() if k != "daily_pnls"} for r in results],
-        "recommendation": best["label"],
+        "baseline": baseline,
+        "weekly": {k: {"pnl":round(v["pnl"],2),"trades":v["trades"],"wins":v["wins"],"losses":v["losses"],
+                       "wr":round(v["wins"]/max(v["trades"],1)*100,1)} for k,v in weekly.items()},
+        "improvements": improvements,
+        "green_weeks": green_weeks, "red_weeks": red_weeks,
     }
-    with open("daily_profit_analysis.json","w") as f:
+    with open("weekly_analysis.json","w") as f:
         json.dump(output, f, indent=2)
-    print(f"  📁 Saved: daily_profit_analysis.json")
+    print(f"  📁 Saved: weekly_analysis.json")
 
 
 if __name__ == "__main__":
